@@ -137,23 +137,128 @@ sub cmd_bundle {
     $self->parse_options(\@args, "p|path=s" => sub { $self->carton->{path} = $_[1] });
 
     my $lock = $self->find_lock;
-    my $local_mirror = $self->carton->local_mirror;
+    my $cpanfile = $self->has_cpanfile;
+    if ($cpanfile && $lock) {
+        require File::stat;
+        my $lock_file = $self->lock_file;
+        my $lock_file_st = File::stat::stat($lock_file);
+        my $cpanfile_st  = File::stat::stat($cpanfile);
+        if ($lock_file_st->mtime <= $cpanfile_st->mtime) {
+            $lock = undef; # carton.lock is old
+        }
+    }
 
+    my $local_mirror = $self->carton->local_mirror;
     $self->carton->configure(
-        lock => $lock,
+        lock        => $lock,
         mirror_file => $self->mirror_file,
     );
 
-    my $cpanfile = $self->has_cpanfile;
+    if ($lock) {
+        my $unsaved_modules = $self->find_unsaved_modules($lock->{modules}, $local_mirror);
+        unless (@$unsaved_modules) {
+            $self->print("All dependencies is up to date\n");
+            return;
+        }
 
-    if ($cpanfile && $lock) {
-        $self->print("Bundling modules using $cpanfile\n");
-        $self->carton->download_from_cpanfile($cpanfile, $local_mirror);
+        $self->print("Bundling modules using carton.lock\n");
+        $self->carton->download_modules($unsaved_modules, $local_mirror);
     } else {
-        $self->error("Can't locate cpanfile and lock file. Run carton install first\n");
+        if ($cpanfile) {
+            $self->print("Bundling modules using $cpanfile\n");
+            $self->carton->download_from_cpanfile($cpanfile, $local_mirror);
+            $self->carton->update_lock_file($self->lock_file);
+            my $lock_data = $self->lock_data; # new lock data
+            $self->cleanup_download_modules($lock_data->{modules}, $local_mirror);
+        } else {
+            $self->error("Can't locate $cpanfile\n");
+            return;
+        }
     }
 
     $self->printf("Complete! Modules were bundled into %s\n", $local_mirror, SUCCESS);
+}
+
+sub find_unsaved_modules {
+    my($self, $modules, $local_mirror) = @_;
+
+    my $unsaved_modules = [];
+    for my $module (keys %$modules) {
+        my $pathname = $modules->{$module}{pathname};
+
+        next if $self->has_local_cache($pathname, $local_mirror);
+        push @$unsaved_modules, $pathname;
+    }
+
+    return $unsaved_modules;
+}
+
+sub has_local_cache {
+    my($self, $pathname, $local_mirror) = @_;
+    return -f "$local_mirror/authors/id/$pathname" ? 1 : 0;
+}
+
+sub cleanup_download_modules {
+    my($self, $modules, $local_mirror) = @_;
+
+    my $saved_modules     = $self->find_saved_modules($local_mirror);
+    my $bundle_moduel_map = +{ map { $modules->{$_}{pathname} => 1 } keys %$modules };
+
+    my @cleanup_target;
+    for my $module (@$saved_modules) {
+        next if $bundle_moduel_map->{$module};
+        push @cleanup_target, $module;
+    }
+    return unless @cleanup_target;
+
+    require File::Basename;
+
+    $self->print("Removing outdated archives\n");
+    for my $target_file (@cleanup_target) {
+        $self->print("--> $target_file\n");
+        my $archive_file = "$local_mirror/authors/id/$target_file";
+        unlink $archive_file or $self->printf("%s: %s", $!, $archive_file, WARN);
+
+        my $archive_dir = File::Basename::dirname($archive_file);
+        $self->remove_empty_dir($local_mirror, $archive_dir);
+    }
+}
+
+sub find_saved_modules {
+    my($self, $local_mirror) = @_;
+    my $archive_dir = "$local_mirror/authors/id/";
+
+    require File::Find;
+    my @saved;
+    my $wanted = sub {
+        return unless -f $_;
+        (my $pathname = $_) =~ s/^$archive_dir//;
+        push @saved, $pathname;
+    };
+    File::Find::find({
+        wanted   => $wanted,
+        no_chdir => 1,
+    }, $archive_dir);
+
+    return \@saved;
+}
+
+sub remove_empty_dir {
+    my($self, $base_dir, $target) = @_;
+
+    opendir my $dh, $target or do {
+        warn "$!: $target";
+        return;
+    };
+    return if grep { !/^\.{1,2}$/ } readdir $dh;
+
+    rmdir $target or do {
+        warn "$!: $target";
+        return;
+    };
+
+    return if $target eq $base_dir;
+    $self->remove_empty_dir($base_dir, File::Basename::dirname($target));
 }
 
 sub cmd_install {

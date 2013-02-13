@@ -72,19 +72,27 @@ sub dedupe_modules {
     return [ reverse @result ];
 }
 
+sub cleanup_download_modules {
+    my($self, $local_mirror) = @_;
+    my $lock_data = $self->lock or return;
 
-sub download_from_cpanfile {
-    my($self, $cpanfile, $local_mirror) = @_;
+    my $saved_module     = $self->find_saved_modules($local_mirror);
+    my $saved_module_map = { map { $_ => 1 } @$saved_module };
 
-    my @modules = $self->list_dependencies;
-    my $modules = $self->dedupe_modules(\@modules);
+    my $modules = $lock_data->{modules};
+    for my $module (keys %$modules) {
+        my $pathname = $modules->{$module}{pathname};
+        next unless $saved_module_map->{$pathname};
+    }
 
-    my $index = $self->build_index($self->lock->{modules});
-    $self->build_mirror_file($index, $self->{mirror_file});
+    return;
+}
+
+sub download_modules {
+    my($self, $modules, $local_mirror) = @_;
 
     my $mirror = $self->{mirror} || $DefaultMirror;
-
-    local $self->{path} = File::Temp::tempdir(CLEANUP => 1); # ignore installed
+    $self->{path} = File::Temp::tempdir(CLEANUP => 1); # ignore installed
 
     $self->run_cpanm(
         "--mirror", $mirror,
@@ -92,7 +100,32 @@ sub download_from_cpanfile {
         "--mirror-index", $self->{mirror_file},
         "--no-skip-satisfied",
         ( $mirror ne $DefaultMirror ? "--mirror-only" : () ),
-        "--scandeps",
+        "--save-dists", $local_mirror,
+        @$modules,
+    );
+}
+
+sub download_from_cpanfile {
+    my($self, $cpanfile, $local_mirror) = @_;
+
+    my @modules = $self->list_dependencies;
+    my $modules = $self->dedupe_modules(\@modules);
+
+    if ($self->lock) {
+        my $index = $self->build_index($self->lock->{modules});
+        $self->build_mirror_file($index, $self->{mirror_file});
+    }
+
+    my $mirror = $self->{mirror} || $DefaultMirror;
+
+    $self->{path} = File::Temp::tempdir(CLEANUP => 1); # ignore installed
+
+    $self->run_cpanm(
+        "--mirror", $mirror,
+        "--mirror", "http://backpan.perl.org/", # fallback
+        ( $self->lock ? ( "--mirror-index" => $self->{mirror_file} ) : () ),
+        "--no-skip-satisfied",
+        ( $mirror ne $DefaultMirror ? "--mirror-only" : () ),
         "--save-dists", $local_mirror,
         @$modules,
     );
